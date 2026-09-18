@@ -64,6 +64,25 @@ python bot.py
 
 Откройте своего бота в Telegram и нажмите `/start`.
 
+### 5. Автозапуск после перезагрузки сервера (опционально)
+
+Чтобы бот сам поднимался после перезагрузки и перезапускался при падении,
+установите его как systemd-сервис (Linux-сервер с systemd):
+
+```bash
+sudo ./scripts/install_service.sh
+```
+
+Скрипт проверит, что venv и `.env`/`parser.session` уже на месте, подставит
+реальные пути в `systemd/tgparserwords.service.template` и включит автозапуск.
+
+```bash
+systemctl status tgparserwords     # статус
+journalctl -u tgparserwords -f     # логи в реальном времени
+systemctl restart tgparserwords    # перезапуск после изменения .env
+systemctl disable tgparserwords    # убрать из автозапуска
+```
+
 ## Как пользоваться
 
 1. **🔗 Чаты** → пришлите ссылки, каждая с новой строки. Понимаются все форматы:
@@ -131,4 +150,6 @@ storage.py    SQLite: чаты, слова, находки, настройки
 config.py     чтение .env
 login.py      разовая авторизация аккаунта
 tests/        тесты
+scripts/      установка автозапуска (systemd)
+systemd/      шаблон systemd-юнита
 ```

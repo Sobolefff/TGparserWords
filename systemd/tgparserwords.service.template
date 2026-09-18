@@ -1,0 +1,29 @@
+# Шаблон systemd-юнита для автозапуска бота после перезагрузки сервера.
+#
+# Не редактируйте этот файл напрямую — запустите scripts/install_service.sh,
+# он подставит реальные пути и установит юнит в систему. Значения {{...}}
+# заполняются автоматически.
+[Unit]
+Description=TGparserWords — Telegram-парсер чатов по ключевым словам
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{SERVICE_USER}}
+WorkingDirectory={{APP_DIR}}
+# .env читает сам bot.py через python-dotenv (config.py), поэтому
+# EnvironmentFile тут не нужен — systemd не умеет вырезать инлайн-комментарии
+# из .env так же аккуратно, как dotenv, и мог бы испортить значения.
+ExecStart={{APP_DIR}}/.venv/bin/python {{APP_DIR}}/bot.py
+Restart=on-failure
+RestartSec=5
+# Не убивать процесс мгновенно — дать корректно закрыть соединения с Telegram
+TimeoutStopSec=20
+
+# Базовая защита: запрет повышения привилегий, отдельный /tmp для процесса
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
