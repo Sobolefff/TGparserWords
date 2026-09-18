@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True: значения из .env всегда главнее уже экспортированных
+# переменных окружения. Без этого правка .env могла бы молча игнорироваться,
+# если та же переменная случайно осталась объявлена в shell/systemd/докере.
+load_dotenv(override=True)
 
 
 def _bool(name: str, default: bool = False) -> bool:
