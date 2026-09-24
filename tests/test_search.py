@@ -17,10 +17,13 @@ class FakeSender:
 
 
 class FakeMessage:
-    def __init__(self, msg_id: int, text: str, date: datetime):
+    def __init__(self, msg_id: int, text: str, date: datetime, entities=None, media=None, file=None):
         self.id = msg_id
         self.raw_text = text
         self.date = date
+        self.entities = entities
+        self.media = media
+        self.file = file
 
     async def get_sender(self):
         return FakeSender()

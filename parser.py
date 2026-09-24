@@ -12,7 +12,14 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
-from telethon.tl.types import Channel, Chat, ChatInviteAlready, User
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    ChatInviteAlready,
+    MessageEntityTextUrl,
+    MessageEntityUrl,
+    User,
+)
 
 log = logging.getLogger("parser")
 
@@ -264,6 +271,12 @@ class Parser:
             link=message_link(entity, msg.id),
         )
 
+    # --- выгрузка полной истории ---
+    async def export_history(self, entity, limit: int | None = None) -> AsyncIterator[dict]:
+        """Отдаёт всю доступную историю чата, сообщение за сообщением (от новых к старым)."""
+        async for msg in self._iter(entity, limit=limit):
+            yield message_to_dict(entity, msg)
+
     # --- мониторинг новых сообщений ---
     def add_monitor(self, callback) -> None:
         """callback(Hit) вызывается для каждого нового подходящего сообщения."""
@@ -303,6 +316,65 @@ def message_link(entity, message_id: int) -> str:
     if isinstance(entity, Channel) and ident:
         return f"https://t.me/c/{ident}/{message_id}"
     return ""
+
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def extract_message_links(msg) -> list[str]:
+    """Ссылки внутри сообщения: явно размеченные Telegram'ом + найденные по тексту."""
+    text = msg.raw_text or ""
+    urls: list[str] = []
+    for ent in msg.entities or ():
+        if isinstance(ent, MessageEntityTextUrl):
+            urls.append(ent.url)
+        elif isinstance(ent, MessageEntityUrl):
+            urls.append(text[ent.offset: ent.offset + ent.length])
+    for m in _URL_RE.finditer(text):
+        urls.append(m.group(0).rstrip(").,;"))
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            result.append(u)
+    return result
+
+
+def media_info(msg) -> dict | None:
+    """Краткое описание вложения: тип, имя файла, mime, размер — если есть медиа."""
+    media = msg.media
+    if media is None:
+        return None
+    info: dict = {"type": type(media).__name__}
+
+    try:
+        file = msg.file
+    except Exception:
+        file = None
+    if file is not None:
+        info["file_name"] = getattr(file, "name", None)
+        info["mime_type"] = getattr(file, "mime_type", None)
+        info["size"] = getattr(file, "size", None)
+
+    webpage = getattr(media, "webpage", None)
+    if webpage is not None:
+        info["url"] = getattr(webpage, "url", None)
+        info["title"] = getattr(webpage, "title", None)
+
+    return info
+
+
+def message_to_dict(entity, msg) -> dict:
+    return {
+        "id": msg.id,
+        "date": msg.date.isoformat() if msg.date else None,
+        "text": msg.raw_text or "",
+        "links": extract_message_links(msg),
+        "media": media_info(msg),
+        "message_link": message_link(entity, msg.id),
+    }
 
 
 async def sender_name(msg) -> str:
