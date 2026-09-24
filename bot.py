@@ -5,8 +5,9 @@ import asyncio
 import csv
 import html
 import io
-import json
 import logging
+import os
+import tempfile
 from datetime import timedelta
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -15,8 +16,9 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import BufferedInputFile, FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 
+import export
 import parser as engine
 import storage
 from config import Config, load_config
@@ -34,10 +36,12 @@ BTN_SEARCH = "🚀 Запустить поиск"
 BTN_MONITOR = "📡 Мониторинг"
 BTN_RESULTS = "📄 Результаты"
 BTN_EXPORT = "📤 Экспорт CSV"
-BTN_HISTORY = "🗂 Выгрузка истории (JSON)"
+BTN_HISTORY_JSON = "🗂 История (JSON)"
+BTN_HISTORY_HTML = "🖼 История (HTML+медиа)"
 BTN_SETTINGS = "⚙️ Настройки"
 BUTTONS = {
-    BTN_CHATS, BTN_WORDS, BTN_SEARCH, BTN_MONITOR, BTN_RESULTS, BTN_EXPORT, BTN_HISTORY, BTN_SETTINGS,
+    BTN_CHATS, BTN_WORDS, BTN_SEARCH, BTN_MONITOR, BTN_RESULTS, BTN_EXPORT,
+    BTN_HISTORY_JSON, BTN_HISTORY_HTML, BTN_SETTINGS,
 }
 
 MENU = ReplyKeyboardMarkup(
@@ -45,7 +49,7 @@ MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_CHATS), KeyboardButton(text=BTN_WORDS)],
         [KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_MONITOR)],
         [KeyboardButton(text=BTN_RESULTS), KeyboardButton(text=BTN_EXPORT)],
-        [KeyboardButton(text=BTN_HISTORY)],
+        [KeyboardButton(text=BTN_HISTORY_JSON), KeyboardButton(text=BTN_HISTORY_HTML)],
         [KeyboardButton(text=BTN_SETTINGS)],
     ],
     resize_keyboard=True,
@@ -69,7 +73,8 @@ dp = Dispatcher()
 class Flow(StatesGroup):
     chats = State()
     words = State()
-    history_link = State()
+    history_json = State()
+    history_html = State()
 
 
 # ------------------------------------------------------------- доступ
@@ -120,14 +125,16 @@ HELP = (
     "2️⃣ <b>Ключевые слова</b> — через запятую или с новой строки.\n"
     "3️⃣ <b>Запустить поиск</b> — пройду по всем чатам и соберу совпадения.\n"
     "4️⃣ <b>Мониторинг</b> — новые сообщения по словам приходят сразу.\n"
-    "5️⃣ <b>Выгрузка истории (JSON)</b> — вся история одного публичного канала/чата "
-    "целиком в один файл, без привязки к ключевым словам.\n\n"
+    "5️⃣ <b>История (JSON)</b> / <b>История (HTML+медиа)</b> — вся история одного "
+    "публичного канала/чата целиком, без привязки к ключевым словам: JSON — компактный "
+    "файл с текстом и метаданными, HTML — читаемая страница с картинками, видео и файлами.\n\n"
     "<b>Команды</b>\n"
     "/chats — список чатов, /delchat N — удалить, /clearchats — очистить\n"
     "/words — список слов, /delword слово, /clearwords\n"
     "/search — поиск, /results — последние находки, /export — CSV\n"
     "/monitor on|off — мониторинг новых сообщений\n"
-    "/exporthistory — выгрузка полной истории чата в JSON\n"
+    "/exporthistory — выгрузка истории чата в JSON\n"
+    "/exporthistoryhtml — выгрузка истории чата в HTML+медиа (zip-архив)\n"
     "/settings — параметры, /set ключ значение — изменить\n"
     "/clearresults — очистить базу находок"
 )
@@ -431,88 +438,160 @@ async def cmd_clearresults(message: Message) -> None:
 
 # --------------------------------------------------- выгрузка истории
 @dp.message(Command("exporthistory"))
-@dp.message(F.text == BTN_HISTORY)
-async def cmd_export_history(message: Message, state: FSMContext) -> None:
+@dp.message(F.text == BTN_HISTORY_JSON)
+async def cmd_export_history_json(message: Message, state: FSMContext) -> None:
     if search_lock.locked():
         await message.answer("Сейчас идёт другая операция (поиск или выгрузка) — дождитесь окончания.")
         return
-    await state.set_state(Flow.history_link)
+    await state.set_state(Flow.history_json)
     await message.answer(
         "Пришлите ссылку на <b>публичный</b> канал или чат, историю которого нужно выгрузить "
         "(например <code>https://t.me/durov</code> или <code>@durov</code>).\n\n"
         "Соберу всю доступную историю сообщений в один JSON-файл: дату и время, текст, "
-        "ссылки из сообщения, ID сообщений и вложения (если есть). Для больших каналов "
-        "это может занять время.",
+        "ссылки из сообщения, ID сообщений и метаданные вложений (если есть). Для больших "
+        "каналов это может занять время.",
         reply_markup=MENU,
     )
 
 
-@dp.message(Flow.history_link, PLAIN_TEXT)
-async def do_export_history(message: Message, state: FSMContext) -> None:
+@dp.message(Command("exporthistoryhtml"))
+@dp.message(F.text == BTN_HISTORY_HTML)
+async def cmd_export_history_html(message: Message, state: FSMContext) -> None:
+    if search_lock.locked():
+        await message.answer("Сейчас идёт другая операция (поиск или выгрузка) — дождитесь окончания.")
+        return
+    await state.set_state(Flow.history_html)
+    await message.answer(
+        "Пришлите ссылку на <b>публичный</b> канал или чат, историю которого нужно выгрузить "
+        "(например <code>https://t.me/durov</code> или <code>@durov</code>).\n\n"
+        "Соберу всю доступную историю в HTML-страницу с картинками, видео, аудио и файлами "
+        "(скачаю и упакую вместе с ней в zip-архив). Файлы крупнее 20 МБ не скачиваю — вместо "
+        "них будет ссылка на оригинальное сообщение. Для больших каналов это может занять "
+        "заметное время и место на диске.",
+        reply_markup=MENU,
+    )
+
+
+@dp.message(Flow.history_json, PLAIN_TEXT)
+async def do_export_history_json(message: Message, state: FSMContext) -> None:
     await state.clear()
-    links = engine.extract_links(message.text or "")
-    link = links[0] if links else (message.text or "").strip()
-    if not engine.normalize_link(link):
+    link = _pick_history_link(message.text or "")
+    if link is None:
         await message.answer(
-            "Не похоже на ссылку на чат/канал. Попробуйте ещё раз — «🗂 Выгрузка истории (JSON)».",
+            "Не похоже на ссылку на чат/канал. Попробуйте ещё раз — «🗂 История (JSON)».",
             reply_markup=MENU,
         )
         return
     if search_lock.locked():
         await message.answer("Сейчас идёт другая операция — попробуйте чуть позже.")
         return
-    asyncio.create_task(run_export_history(message, link))
+    asyncio.create_task(run_export_json(message, link))
 
 
-async def run_export_history(message: Message, link: str) -> None:
-    async with search_lock:
-        status = await message.answer(f"📥 Подключаюсь к {html.escape(link)}…")
-        try:
-            entity = await parser.resolve(link)
-        except Exception as exc:
-            await edit_status(status, f"⚠️ Не удалось открыть чат: {exc or exc.__class__.__name__}")
-            return
-
-        title = engine.title_of(entity)
-        messages: list[dict] = []
-        try:
-            async for item in parser.export_history(entity):
-                messages.append(item)
-                if len(messages) % 500 == 0:
-                    await edit_status(
-                        status, f"📥 {html.escape(title)}: выгружено {len(messages)} сообщений…"
-                    )
-        except Exception as exc:
-            log.exception("ошибка выгрузки истории %s", link)
-            await edit_status(
-                status,
-                f"⚠️ Ошибка при выгрузке: {exc or exc.__class__.__name__}\n"
-                f"Частично собрано: {len(messages)} сообщений.",
-            )
-            if not messages:
-                return
-
-        messages.reverse()  # от старых сообщений к новым
-        payload = {
-            "chat": {
-                "title": title,
-                "username": getattr(entity, "username", None),
-                "id": engine.chat_id_of(entity),
-                "link": link,
-            },
-            "exported_at": engine.utc_now().isoformat(),
-            "messages_count": len(messages),
-            "messages": messages,
-        }
-        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-
-        await edit_status(status, f"✅ Готово: {len(messages)} сообщений. Отправляю файл…")
-        stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
-        await message.answer_document(
-            BufferedInputFile(data, filename=f"history_{stem}.json"),
-            caption=f"История «{title}»: {len(messages)} сообщений.",
+@dp.message(Flow.history_html, PLAIN_TEXT)
+async def do_export_history_html(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    link = _pick_history_link(message.text or "")
+    if link is None:
+        await message.answer(
+            "Не похоже на ссылку на чат/канал. Попробуйте ещё раз — «🖼 История (HTML+медиа)».",
             reply_markup=MENU,
         )
+        return
+    if search_lock.locked():
+        await message.answer("Сейчас идёт другая операция — попробуйте чуть позже.")
+        return
+    asyncio.create_task(run_export_html(message, link))
+
+
+def _pick_history_link(text: str) -> str | None:
+    links = engine.extract_links(text)
+    link = links[0] if links else text.strip()
+    return link if engine.normalize_link(link) else None
+
+
+async def _resolve_for_export(message: Message, status: Message, link: str):
+    try:
+        return await parser.resolve(link)
+    except Exception as exc:
+        await edit_status(status, f"⚠️ Не удалось открыть чат: {exc or exc.__class__.__name__}")
+        return None
+
+
+async def _send_export_file(message: Message, path: str, filename: str, caption: str) -> None:
+    try:
+        await message.answer_document(
+            FSInputFile(path, filename=filename), caption=caption, reply_markup=MENU,
+        )
+    except Exception as exc:
+        log.exception("не удалось отправить файл выгрузки")
+        await message.answer(
+            f"⚠️ Не удалось отправить файл: {exc or exc.__class__.__name__}\n"
+            "Возможно, превышен лимит Telegram на документы для ботов (~50 МБ).",
+            reply_markup=MENU,
+        )
+
+
+async def run_export_json(message: Message, link: str) -> None:
+    async with search_lock:
+        status = await message.answer(f"📥 Подключаюсь к {html.escape(link)}…")
+        entity = await _resolve_for_export(message, status, link)
+        if entity is None:
+            return
+        title = engine.title_of(entity)
+
+        with tempfile.TemporaryDirectory(prefix="tgexport_") as tmp:
+            out_path = os.path.join(tmp, "history.json")
+
+            async def progress(count: int) -> None:
+                await edit_status(status, f"📥 {html.escape(title)}: выгружено {count} сообщений…")
+
+            try:
+                count = await export.export_json(parser, entity, out_path, progress=progress)
+            except Exception as exc:
+                log.exception("ошибка выгрузки истории (json) %s", link)
+                await edit_status(status, f"⚠️ Ошибка при выгрузке: {exc or exc.__class__.__name__}")
+                return
+
+            await edit_status(status, f"✅ Готово: {count} сообщений. Отправляю файл…")
+            stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
+            await _send_export_file(
+                message, out_path, f"history_{stem}.json", f"История «{title}»: {count} сообщений.",
+            )
+
+
+async def run_export_html(message: Message, link: str) -> None:
+    async with search_lock:
+        status = await message.answer(f"📥 Подключаюсь к {html.escape(link)}…")
+        entity = await _resolve_for_export(message, status, link)
+        if entity is None:
+            return
+        title = engine.title_of(entity)
+
+        with tempfile.TemporaryDirectory(prefix="tgexport_") as tmp:
+
+            async def progress(count: int) -> None:
+                await edit_status(
+                    status, f"📥 {html.escape(title)}: выгружено {count} сообщений (со вложениями)…"
+                )
+
+            try:
+                _html_path, count = await export.export_html(parser, entity, tmp, progress=progress)
+            except Exception as exc:
+                log.exception("ошибка выгрузки истории (html) %s", link)
+                await edit_status(status, f"⚠️ Ошибка при выгрузке: {exc or exc.__class__.__name__}")
+                return
+
+            await edit_status(status, f"📦 Собираю архив ({count} сообщений)…")
+            stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
+            zip_path = os.path.join(tmp, f"history_{stem}.zip")
+            export.zip_dir(tmp, zip_path, exclude={os.path.basename(zip_path)})
+
+            await edit_status(status, "✅ Готово. Отправляю архив…")
+            await _send_export_file(
+                message, zip_path, f"history_{stem}.zip",
+                f"История «{title}»: {count} сообщений, HTML + медиа (index.html внутри архива).",
+            )
 
 
 # ----------------------------------------------------------- настройки

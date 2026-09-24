@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -272,10 +273,39 @@ class Parser:
         )
 
     # --- выгрузка полной истории ---
+    async def iter_history(self, entity, limit: int | None = None):
+        """Все сообщения чата от старых к новым (Telethon reverse=True) — без фильтра по словам."""
+        async for msg in self._iter(entity, limit=limit, reverse=True):
+            yield msg
+
     async def export_history(self, entity, limit: int | None = None) -> AsyncIterator[dict]:
-        """Отдаёт всю доступную историю чата, сообщение за сообщением (от новых к старым)."""
-        async for msg in self._iter(entity, limit=limit):
+        """Отдаёт всю доступную историю чата в виде словарей, от старых сообщений к новым."""
+        async for msg in self.iter_history(entity, limit=limit):
             yield message_to_dict(entity, msg)
+
+    async def download_media_file(
+        self, msg, dest_dir: str, max_size: int | None = None
+    ) -> str | None:
+        """Скачивает медиа сообщения в dest_dir, отдаёт путь к файлу или None (нет медиа/слишком
+        большое/не удалось скачать)."""
+        if msg.media is None:
+            return None
+        size = getattr(getattr(msg, "file", None), "size", None)
+        if max_size and size and size > max_size:
+            return None
+        dest = os.path.join(dest_dir, str(msg.id))
+        while True:
+            try:
+                return await self.client.download_media(msg, file=dest)
+            except FloodWaitError as exc:
+                if exc.seconds > self.cfg.max_flood_wait:
+                    log.warning("FloodWait %s сек при скачивании медиа %s — пропущено", exc.seconds, msg.id)
+                    return None
+                log.info("FloodWait %s сек — ждём (медиа)", exc.seconds)
+                await asyncio.sleep(exc.seconds + 1)
+            except Exception:
+                log.exception("не удалось скачать медиа сообщения %s", msg.id)
+                return None
 
     # --- мониторинг новых сообщений ---
     def add_monitor(self, callback) -> None:
@@ -364,6 +394,23 @@ def media_info(msg) -> dict | None:
         info["title"] = getattr(webpage, "title", None)
 
     return info
+
+
+def media_kind(msg) -> str | None:
+    """Грубая классификация вложения для HTML-выгрузки: photo/video/audio/sticker/document/other."""
+    if msg.photo:
+        return "photo"
+    if msg.video or msg.gif or msg.video_note:
+        return "video"
+    if msg.voice or msg.audio:
+        return "audio"
+    if msg.sticker:
+        return "sticker"
+    if msg.document:
+        return "document"
+    if msg.media is not None:
+        return "other"
+    return None
 
 
 def message_to_dict(entity, msg) -> dict:

@@ -17,13 +17,25 @@ class FakeSender:
 
 
 class FakeMessage:
-    def __init__(self, msg_id: int, text: str, date: datetime, entities=None, media=None, file=None):
+    def __init__(
+        self, msg_id: int, text: str, date: datetime, entities=None, media=None, file=None,
+        photo=None, video=None, audio=None, voice=None, video_note=None, gif=None,
+        sticker=None, document=None,
+    ):
         self.id = msg_id
         self.raw_text = text
         self.date = date
         self.entities = entities
         self.media = media
         self.file = file
+        self.photo = photo
+        self.video = video
+        self.audio = audio
+        self.voice = voice
+        self.video_note = video_note
+        self.gif = gif
+        self.sticker = sticker
+        self.document = document
 
     async def get_sender(self):
         return FakeSender()
@@ -36,7 +48,7 @@ class FakeClient:
         self.messages = messages
         self.calls = []
 
-    def iter_messages(self, entity, limit=None, search=None):
+    def iter_messages(self, entity, limit=None, search=None, reverse=False):
         self.calls.append(search)
         # грубая имитация полнотекстового поиска Telegram: по основе слова
         needle = engine.stem(engine.normalize_text(search)) if search else None
@@ -44,12 +56,20 @@ class FakeClient:
             m for m in self.messages
             if needle is None or needle in engine.normalize_text(m.raw_text or "")
         ]
+        if reverse:
+            chosen = list(reversed(chosen))
 
         async def gen():
             for msg in chosen[:limit] if limit else chosen:
                 yield msg
 
         return gen()
+
+    async def download_media(self, msg, file=None):
+        path = f"{file}.bin"
+        with open(path, "wb") as f:
+            f.write(b"data")
+        return path
 
 
 def build_parser(messages):
