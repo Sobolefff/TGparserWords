@@ -150,7 +150,7 @@ HELP = (
     "/search — поиск, /results — последние находки, /export — CSV\n"
     "/monitor on|off — мониторинг новых сообщений\n"
     "/exporthistory — выгрузка истории чата в JSON\n"
-    "/exporthistoryhtml — выгрузка истории чата в HTML+медиа (zip-архив)\n"
+    "/exporthistoryhtml — выгрузка истории чата в HTML (вложения встроены в файл)\n"
     "/cancel — прервать текущий поиск или выгрузку\n"
     "/settings — параметры, /set ключ значение — изменить\n"
     "/clearresults — очистить базу находок"
@@ -491,10 +491,10 @@ async def cmd_export_history_html(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Пришлите ссылку на <b>публичный</b> канал или чат, историю которого нужно выгрузить "
         "(например <code>https://t.me/durov</code> или <code>@durov</code>).\n\n"
-        "Соберу всю доступную историю в HTML-страницу с картинками, видео, аудио и файлами "
-        "(скачаю и упакую вместе с ней в zip-архив). Файлы крупнее 20 МБ не скачиваю — вместо "
-        "них будет ссылка на оригинальное сообщение. Для больших каналов это может занять "
-        "заметное время и место на диске.",
+        "Соберу всю доступную историю в HTML-страницу с картинками, видео и аудио — вложения "
+        "встрою прямо в файл, отдельной папки не будет: так надёжнее открывается в браузере. "
+        "Файлы крупнее 20 МБ не встраиваю — вместо них будет ссылка на оригинальное сообщение. "
+        "Для больших каналов это может занять заметное время.",
         reply_markup=MENU,
     )
 
@@ -569,13 +569,13 @@ async def _send_export_parts(message: Message, paths: list[str], base_caption: s
             await asyncio.sleep(1)  # не долбить Telegram сериями документов без паузы
 
 
-def _finalize_json_parts(part_paths: list[str], stem) -> list[str]:
-    """Переименовывает временные .partNNN-файлы в финальные history_<stem>[.partXofY].json."""
+def _finalize_parts(part_paths: list[str], stem, ext: str) -> list[str]:
+    """Переименовывает временные .partNNN-файлы в финальные history_<stem>[.partXofY].<ext>."""
     total = len(part_paths)
     result = []
     for i, path in enumerate(part_paths, start=1):
         suffix = f".part{i:03d}of{total:03d}" if total > 1 else ""
-        new_path = os.path.join(os.path.dirname(path), f"history_{stem}{suffix}.json")
+        new_path = os.path.join(os.path.dirname(path), f"history_{stem}{suffix}.{ext}")
         os.replace(path, new_path)
         result.append(new_path)
     return result
@@ -609,7 +609,7 @@ async def run_export_json(message: Message, link: str) -> None:
             note = f", файлов: {total}" if total > 1 else ""
             await edit_status(status, f"✅ Готово: {count} сообщений{note}. Отправляю…")
             stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
-            final_paths = _finalize_json_parts(part_paths, stem)
+            final_paths = _finalize_parts(part_paths, stem, "json")
             await _send_export_parts(message, final_paths, f"История «{title}»: {count} сообщений.")
 
 
@@ -629,24 +629,25 @@ async def run_export_html(message: Message, link: str) -> None:
                 )
 
             try:
-                _html_path, count = await export.export_html(parser, entity, tmp, progress=progress)
+                part_paths, count = await export.export_html(
+                    parser, entity, tmp, progress=progress,
+                    max_bytes=cfg.max_upload_mb * 1024 * 1024,
+                )
             except Exception as exc:
                 log.exception("ошибка выгрузки истории (html) %s", link)
                 await edit_status(status, f"⚠️ Ошибка при выгрузке: {exc or exc.__class__.__name__}")
                 return
 
-            await edit_status(status, f"📦 Собираю архив ({count} сообщений)…")
-            stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
-            zip_base = os.path.join(tmp, f"history_{stem}.zip")
-            part_paths = export.zip_dir_split(tmp, zip_base, max_bytes=cfg.max_upload_mb * 1024 * 1024)
-
             total = len(part_paths)
-            note = f" ({total} файла(ов))" if total > 1 else ""
-            await edit_status(status, f"✅ Готово{note}. Отправляю…")
-            caption = f"История «{title}»: {count} сообщений, HTML + медиа (index.html внутри архива)."
-            if total > 1:
-                caption += " Распакуйте ВСЕ части в одну папку — медиа и страница соберутся вместе."
-            await _send_export_parts(message, part_paths, caption)
+            note = f", файлов: {total}" if total > 1 else ""
+            await edit_status(status, f"✅ Готово: {count} сообщений{note}. Отправляю…")
+            stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
+            final_paths = _finalize_parts(part_paths, stem, "html")
+            caption = (
+                f"История «{title}»: {count} сообщений. Картинки и медиа встроены прямо в файл — "
+                "просто откройте его в браузере, ничего распаковывать не нужно."
+            )
+            await _send_export_parts(message, final_paths, caption)
 
 
 # ----------------------------------------------------------- настройки

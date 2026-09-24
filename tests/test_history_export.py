@@ -4,7 +4,6 @@ import os
 import sys
 import tempfile
 import unittest
-import zipfile
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -202,36 +201,42 @@ class TestExportModule(unittest.IsolatedAsyncioTestCase):
         ]
         parser = build_parser(messages)
         with tempfile.TemporaryDirectory() as tmp:
-            html_path, count = await export_mod.export_html(parser, CHANNEL, tmp)
+            part_paths, count = await export_mod.export_html(parser, CHANNEL, tmp)
             self.assertEqual(count, 3)
-            with open(html_path, encoding="utf-8") as f:
+            self.assertEqual(len(part_paths), 1)
+            with open(part_paths[0], encoding="utf-8") as f:
                 content = f.read()
-            self.assertIn("<img", content)
+            self.assertIn('<img src="data:', content)  # встроено как data:URI, без папки media/
             self.assertIn("просто текст", content)
             self.assertIn("слишком большое", content)
-            media_files = os.listdir(os.path.join(tmp, export_mod.MEDIA_SUBDIR))
-            self.assertEqual(len(media_files), 1)  # большой файл не скачан
+            # временная папка для скачивания пуста — файлы удалены после встраивания в HTML
+            dl_dir = os.path.join(tmp, "_dl")
+            self.assertEqual(os.listdir(dl_dir) if os.path.isdir(dl_dir) else [], [])
 
-    async def test_zip_dir_split_keeps_each_part_under_limit(self):
+    async def test_export_html_splits_when_over_limit(self):
+        photo_media = type("MessageMediaPhoto", (), {})()
         messages = [
             FakeMessage(
-                i, f"файл {i}", datetime(2026, 1, 1, tzinfo=timezone.utc),
-                media=type("MessageMediaDocument", (), {})(), document=True,
+                i, f"фото {i}", datetime(2026, 1, 1, tzinfo=timezone.utc),
+                media=photo_media, photo=True,
             )
             for i in range(1, 4)
         ]
         parser = build_parser(messages)
         with tempfile.TemporaryDirectory() as tmp:
-            await export_mod.export_html(parser, CHANNEL, tmp)
-            zip_base = os.path.join(tmp, "history.zip")
-            # download_media у FakeClient пишет 4 байта — лимит в 1 байт заставит разложить
-            # каждый файл в свою часть архива
-            part_paths = export_mod.zip_dir_split(tmp, zip_base, max_bytes=1)
+            # лимит меньше, чем один блок с картинкой — каждая часть возьмёт по одному сообщению
+            part_paths, count = await export_mod.export_html(parser, CHANNEL, tmp, max_bytes=200)
+            self.assertEqual(count, 3)
             self.assertEqual(len(part_paths), 3)
+            total_in_parts = 0
             for path in part_paths:
                 self.assertTrue(os.path.isfile(path))
-                with zipfile.ZipFile(path) as zf:
-                    self.assertIn("index.html", zf.namelist())
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+                self.assertIn("<!DOCTYPE html>", content)
+                self.assertIn("</html>", content)
+                total_in_parts += content.count('class="msg"')
+            self.assertEqual(total_in_parts, count)
 
 
 if __name__ == "__main__":

@@ -6,13 +6,14 @@
 """
 from __future__ import annotations
 
+import base64
 import html as html_lib
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
-import zipfile
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
@@ -41,7 +42,6 @@ class _Progress:
             self._last_ts = now
             await self._cb(count)
 
-MEDIA_SUBDIR = "media"
 MAX_MEDIA_SIZE = 20 * 1024 * 1024  # 20 МБ — крупные файлы не тянем, оставляем ссылку на оригинал
 DEFAULT_MAX_BYTES = 45 * 1024 * 1024  # дефолт, если вызывающий код не передал свой лимит
 
@@ -195,25 +195,111 @@ _HTML_TAIL = """</main>
 </html>
 """
 
-_MEDIA_TAG = {
-    "photo": '<img loading="lazy" src="{src}" alt="">',
-    "video": '<video controls preload="none" src="{src}"></video>',
-    "audio": '<audio controls src="{src}"></audio>',
-    "sticker": '<img loading="lazy" src="{src}" alt="стикер">',
-}
+# фото/видео/аудио/стикеры встраиваются как data:URI — без отдельной папки и без
+# относительных путей, от которых зависело отображение в некоторых браузерах при
+# просмотре локального файла (file://).
+_EMBED_TAG = {"photo": "img", "sticker": "img", "video": "video", "audio": "audio"}
 
 
-def _media_block(kind: str | None, rel_path: str | None, msg) -> str:
+def _data_uri(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _media_block(kind: str | None, abs_path: str | None, msg) -> str:
     if kind is None:
         return ""
-    if rel_path is None:
+    if abs_path is None:
         size = getattr(getattr(msg, "file", None), "size", None)
         note = "слишком большое" if size and size > MAX_MEDIA_SIZE else "не удалось скачать"
         return f'<div class="missing">📎 вложение ({html_lib.escape(kind)}), {note}</div>'
-    if kind in _MEDIA_TAG:
-        return _MEDIA_TAG[kind].format(src=rel_path)
-    name = getattr(getattr(msg, "file", None), "name", None) or os.path.basename(rel_path)
-    return f'<a class="file" href="{rel_path}" download>📎 {html_lib.escape(name)}</a>'
+
+    uri = _data_uri(abs_path)
+    if uri is None:
+        return f'<div class="missing">📎 вложение ({html_lib.escape(kind)}), ошибка чтения файла</div>'
+
+    tag = _EMBED_TAG.get(kind)
+    if tag == "img":
+        alt = "стикер" if kind == "sticker" else ""
+        return f'<img src="{uri}" alt="{alt}">'
+    if tag == "video":
+        return f'<video controls preload="metadata" src="{uri}"></video>'
+    if tag == "audio":
+        return f'<audio controls src="{uri}"></audio>'
+
+    name = getattr(getattr(msg, "file", None), "name", None) or os.path.basename(abs_path)
+    return f'<a class="file" href="{uri}" download="{html_lib.escape(name)}">📎 {html_lib.escape(name)}</a>'
+
+
+def _message_block_html(msg_id: int, date: str, link: str, media_html: str, text: str) -> str:
+    parts = [
+        f'<div class="msg" id="m{msg_id}">\n',
+        '  <div class="meta">'
+        f'<span>{html_lib.escape(date)}</span>'
+        f'<a href="{link or "#"}" target="_blank" rel="noopener">#{msg_id}</a>'
+        '</div>\n',
+    ]
+    if media_html:
+        parts.append(f"  {media_html}\n")
+    if text:
+        parts.append(f'  <div class="text">{_linkify(text)}</div>\n')
+    parts.append("</div>\n")
+    return "".join(parts)
+
+
+class _HtmlPartWriter:
+    """Пишет HTML-страницы по частям — каждая часть самостоятельна и не крупнее max_bytes.
+
+    В отличие от прежней версии с отдельной папкой media/, вложения теперь встроены прямо
+    в разметку (data:URI), поэтому часть — это ровно один цельный, независимо открываемый
+    .html файл, без внешних зависимостей и без необходимости что-либо распаковывать.
+    """
+
+    def __init__(self, base_path: str, max_bytes: int, title: str):
+        self.base_path = base_path
+        self.max_bytes = max_bytes
+        self.title = title
+        self.part_paths: list[str] = []
+        self._f = None
+        self._bytes_in_part = 0
+        self._count_in_part = 0
+        self._part_num = 0
+        self._open_new_part()
+
+    def _open_new_part(self) -> None:
+        self._part_num += 1
+        path = _part_path(self.base_path, self._part_num)
+        self.part_paths.append(path)
+        self._f = open(path, "w", encoding="utf-8")
+        header = _HTML_HEAD.format(
+            title=html_lib.escape(self.title),
+            exported_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        )
+        self._f.write(header)
+        self._bytes_in_part = len(header.encode("utf-8"))
+        self._count_in_part = 0
+
+    def write_message(self, block_html: str) -> None:
+        piece_bytes = len(block_html.encode("utf-8"))
+        if self._count_in_part > 0 and self._bytes_in_part + piece_bytes > self.max_bytes:
+            self._close_part()
+            self._open_new_part()
+        self._f.write(block_html)
+        self._bytes_in_part += piece_bytes
+        self._count_in_part += 1
+
+    def _close_part(self) -> None:
+        self._f.write(_HTML_TAIL.format(count=self._count_in_part))
+        self._f.close()
+
+    def close(self) -> list[str]:
+        self._close_part()
+        return self.part_paths
 
 
 async def export_html(
@@ -222,95 +308,47 @@ async def export_html(
     work_dir: str,
     progress: ProgressCB = None,
     download_media: bool = True,
-) -> tuple[str, int]:
-    """Строит work_dir/index.html (+ work_dir/media/*) потоково, отдаёт (html_path, число сообщений)."""
-    media_dir = os.path.join(work_dir, MEDIA_SUBDIR)
-    os.makedirs(media_dir, exist_ok=True)
-    html_path = os.path.join(work_dir, "index.html")
-    title = engine.title_of(entity)
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> tuple[list[str], int]:
+    """Строит HTML-страницу(ы) с вложениями, встроенными прямо в файл (data:URI).
 
+    Разбивает на несколько самостоятельных .html-файлов, если суммарный размер (с учётом
+    встроенных вложений) превышает max_bytes. Отдаёт (пути частей, число сообщений).
+    """
+    title = engine.title_of(entity)
+    tmp_media_dir = os.path.join(work_dir, "_dl")
+    os.makedirs(tmp_media_dir, exist_ok=True)
+
+    writer = _HtmlPartWriter(os.path.join(work_dir, "history.html"), max_bytes, title)
     count = 0
     tracker = _Progress(progress)
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(_HTML_HEAD.format(
-            title=html_lib.escape(title),
-            exported_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        ))
 
-        async for msg in parser.iter_history(entity):
-            kind = engine.media_kind(msg)
-            rel_path = None
-            if kind and download_media:
-                try:
-                    abs_path = await parser.download_media_file(msg, media_dir, max_size=MAX_MEDIA_SIZE)
-                except Exception:
-                    log.exception("ошибка скачивания медиа сообщения %s", msg.id)
-                    abs_path = None
-                if abs_path:
-                    rel_path = f"{MEDIA_SUBDIR}/{os.path.basename(abs_path)}"
+    async for msg in parser.iter_history(entity):
+        kind = engine.media_kind(msg)
+        abs_path = None
+        if kind and download_media:
+            try:
+                abs_path = await parser.download_media_file(msg, tmp_media_dir, max_size=MAX_MEDIA_SIZE)
+            except Exception:
+                log.exception("ошибка скачивания медиа сообщения %s", msg.id)
+                abs_path = None
 
-            date = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else "—"
-            link = engine.message_link(entity, msg.id)
-            text = msg.raw_text or ""
+        media_html = _media_block(kind, abs_path, msg)
 
-            f.write(f'<div class="msg" id="m{msg.id}">\n')
-            f.write('  <div class="meta">'
-                     f'<span>{html_lib.escape(date)}</span>'
-                     f'<a href="{link or "#"}" target="_blank" rel="noopener">#{msg.id}</a>'
-                     '</div>\n')
-            media_html = _media_block(kind, rel_path, msg)
-            if media_html:
-                f.write(f"  {media_html}\n")
-            if text:
-                f.write(f'  <div class="text">{_linkify(text)}</div>\n')
-            f.write("</div>\n")
+        if abs_path:
+            try:
+                os.remove(abs_path)  # уже встроили в HTML — на диске больше не нужен
+            except OSError:
+                pass
 
-            count += 1
-            await tracker.tick(count)
+        date = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else "—"
+        link = engine.message_link(entity, msg.id)
+        writer.write_message(
+            _message_block_html(msg.id, date, link, media_html, msg.raw_text or "")
+        )
 
-        f.write(_HTML_TAIL.format(count=count))
+        count += 1
+        await tracker.tick(count)
 
-    return html_path, count
-
-
-def zip_dir_split(
-    src_dir: str, base_zip_path: str, max_bytes: int = DEFAULT_MAX_BYTES,
-) -> list[str]:
-    """Пакует work_dir (index.html + media/) в один или несколько zip ≤ max_bytes.
-
-    index.html копируется в каждую часть (он маленький), остальные файлы (медиа)
-    раскладываются по частям жадным упаковщиком по размеру. Части нужно распаковать
-    в одну и ту же папку — тогда все медиа лягут рядом с одной страницей index.html.
-    """
-    html_path = os.path.join(src_dir, "index.html")
-    html_size = os.path.getsize(html_path) if os.path.isfile(html_path) else 0
-
-    media_dir = os.path.join(src_dir, MEDIA_SUBDIR)
-    media_files: list[tuple[str, int]] = []
-    if os.path.isdir(media_dir):
-        for name in sorted(os.listdir(media_dir)):
-            path = os.path.join(media_dir, name)
-            if os.path.isfile(path):
-                media_files.append((path, os.path.getsize(path)))
-
-    parts: list[list[str]] = [[]]
-    sizes = [html_size]
-    for path, size in media_files:
-        if sizes[-1] + size > max_bytes and parts[-1]:
-            parts.append([])
-            sizes.append(html_size)
-        parts[-1].append(path)
-        sizes[-1] += size
-
-    total = len(parts)
-    root, _ext = os.path.splitext(base_zip_path)
-    part_paths = []
-    for i, files in enumerate(parts, start=1):
-        zip_path = f"{root}.part{i:03d}of{total:03d}.zip" if total > 1 else f"{root}.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            if os.path.isfile(html_path):
-                zf.write(html_path, "index.html")
-            for path in files:
-                zf.write(path, os.path.relpath(path, src_dir))
-        part_paths.append(zip_path)
-    return part_paths
+    part_paths = writer.close()
+    return part_paths, count
