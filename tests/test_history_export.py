@@ -13,6 +13,7 @@ from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl  # noqa: E4
 
 import export as export_mod  # noqa: E402
 import parser as engine  # noqa: E402
+from config import Config  # noqa: E402
 
 from test_search import CHANNEL, FakeMessage, build_parser  # noqa: E402
 
@@ -84,6 +85,51 @@ class TestMediaKind(unittest.TestCase):
         self.assertEqual(engine.media_kind(FakeMessage(4, "", now, sticker=True, media=True)), "sticker")
         self.assertEqual(engine.media_kind(FakeMessage(5, "", now, document=True, media=True)), "document")
         self.assertIsNone(engine.media_kind(FakeMessage(6, "", now)))
+
+
+class _WritesThenFailsClient:
+    """Имитирует гонку asyncio.wait_for / обрыв сети: файл на диск дописывается, но потом
+    всё равно летит исключение — как будто скачивание «не удалось», хотя оно удалось."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    async def download_media(self, msg, file=None):
+        path = f"{file}.jpg"
+        with open(path, "wb") as f:
+            f.write(self.payload)
+        raise RuntimeError("connection reset after write")
+
+
+def _build_bare_parser(client) -> engine.Parser:
+    p = object.__new__(engine.Parser)
+    p.cfg = Config(api_id=1, api_hash="x", bot_token="y", media_timeout=5, max_flood_wait=10)
+    p.client = client
+    p._entity_cache = {}
+    return p
+
+
+class TestDownloadRecovery(unittest.IsolatedAsyncioTestCase):
+    async def test_recovers_file_written_before_the_failure(self):
+        payload = b"jpegbytes"
+        parser = _build_bare_parser(_WritesThenFailsClient(payload))
+        msg = FakeMessage(7, "", datetime.now(timezone.utc), media=True, file=FakeFile(size=len(payload)))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = await parser.download_media_file(msg, tmp)
+            self.assertIsNotNone(path)
+            self.assertTrue(os.path.isfile(path))
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+    async def test_discards_truncated_file(self):
+        payload = b"only-part"
+        parser = _build_bare_parser(_WritesThenFailsClient(payload))
+        # ожидаемый размер больше того, что реально записалось — файл обрезан
+        msg = FakeMessage(8, "", datetime.now(timezone.utc), media=True, file=FakeFile(size=len(payload) + 100))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = await parser.download_media_file(msg, tmp)
+            self.assertIsNone(path)
+            self.assertEqual(os.listdir(tmp), [])  # обрезанный файл удалён
 
 
 class TestExportHistory(unittest.IsolatedAsyncioTestCase):

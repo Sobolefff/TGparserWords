@@ -287,7 +287,13 @@ class Parser:
         self, msg, dest_dir: str, max_size: int | None = None
     ) -> str | None:
         """Скачивает медиа сообщения в dest_dir, отдаёт путь к файлу или None (нет медиа/слишком
-        большое/не удалось скачать)."""
+        большое/не удалось скачать).
+
+        Если Telethon бросил исключение (тайм-аут, обрыв соединения и т.п.) уже ПОСЛЕ того,
+        как файл фактически дописался на диск — это гонка asyncio.wait_for / обрыв сети уже
+        после записи, а не настоящий провал скачивания. Перед тем как сдаться, проверяем диск
+        и используем файл, если он там цел (размер совпадает с ожидаемым).
+        """
         if msg.media is None:
             return None
         size = getattr(getattr(msg, "file", None), "size", None)
@@ -302,17 +308,46 @@ class Parser:
             except FloodWaitError as exc:
                 if exc.seconds > self.cfg.max_flood_wait:
                     log.warning("FloodWait %s сек при скачивании медиа %s — пропущено", exc.seconds, msg.id)
-                    return None
+                    return self._recover_download(dest, size)
                 log.info("FloodWait %s сек — ждём (медиа)", exc.seconds)
                 await asyncio.sleep(exc.seconds + 1)
             except asyncio.TimeoutError:
                 log.warning(
-                    "скачивание медиа %s не уложилось в %s сек — пропущено", msg.id, self.cfg.media_timeout
+                    "скачивание медиа %s не уложилось в %s сек", msg.id, self.cfg.media_timeout
                 )
-                return None
+                return self._recover_download(dest, size)
             except Exception:
-                log.exception("не удалось скачать медиа сообщения %s", msg.id)
+                log.exception("ошибка при скачивании медиа сообщения %s", msg.id)
+                return self._recover_download(dest, size)
+
+    @staticmethod
+    def _recover_download(dest: str, expected_size: int | None) -> str | None:
+        """Ищет в dest_dir файл dest[.ext], записанный до сбоя, и отдаёт его, если он цел."""
+        dest_dir, prefix = os.path.split(dest)
+        try:
+            names = os.listdir(dest_dir)
+        except OSError:
+            return None
+        for name in names:
+            stem, _ext = os.path.splitext(name)
+            if stem != prefix:
+                continue
+            path = os.path.join(dest_dir, name)
+            try:
+                actual_size = os.path.getsize(path)
+            except OSError:
+                continue
+            if expected_size and actual_size != expected_size:
+                log.warning("файл %s записан не полностью (%s из %s байт) — удаляю", path, actual_size, expected_size)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
                 return None
+            if actual_size > 0:
+                log.info("медиа %s всё же записалось на диск до сбоя — использую файл", prefix)
+                return path
+        return None
 
     # --- мониторинг новых сообщений ---
     def add_monitor(self, callback) -> None:
