@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -109,13 +110,34 @@ class TestExportModule(unittest.IsolatedAsyncioTestCase):
         parser = build_parser(messages)
         with tempfile.TemporaryDirectory() as tmp:
             out_path = os.path.join(tmp, "history.json")
-            count = await export_mod.export_json(parser, CHANNEL, out_path)
+            part_paths, count = await export_mod.export_json(parser, CHANNEL, out_path)
             self.assertEqual(count, 2)
-            with open(out_path, encoding="utf-8") as f:
+            self.assertEqual(len(part_paths), 1)  # уложилось в один файл — лимит не задавали
+            with open(part_paths[0], encoding="utf-8") as f:
                 payload = json.load(f)
             self.assertEqual(payload["messages_count"], 2)
             self.assertEqual(payload["chat"]["title"], "Тестовый чат")
             self.assertEqual(len(payload["messages"]), 2)
+
+    async def test_export_json_splits_when_over_limit(self):
+        messages = [
+            FakeMessage(i, f"сообщение номер {i}", datetime(2026, 1, 1, tzinfo=timezone.utc))
+            for i in range(1, 6)
+        ]
+        parser = build_parser(messages)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "history.json")
+            # лимит меньше, чем два сообщения подряд — каждая часть возьмёт по одному
+            part_paths, count = await export_mod.export_json(parser, CHANNEL, out_path, max_bytes=90)
+            self.assertEqual(count, 5)
+            self.assertGreater(len(part_paths), 1)
+            total_messages = 0
+            for path in part_paths:
+                with open(path, encoding="utf-8") as f:
+                    payload = json.load(f)
+                total_messages += payload["messages_count"]
+                self.assertEqual(payload["chat"]["title"], "Тестовый чат")
+            self.assertEqual(total_messages, count)
 
     async def test_export_html_embeds_media_and_skips_oversized(self):
         photo_media = type("MessageMediaPhoto", (), {})()
@@ -143,6 +165,27 @@ class TestExportModule(unittest.IsolatedAsyncioTestCase):
             self.assertIn("слишком большое", content)
             media_files = os.listdir(os.path.join(tmp, export_mod.MEDIA_SUBDIR))
             self.assertEqual(len(media_files), 1)  # большой файл не скачан
+
+    async def test_zip_dir_split_keeps_each_part_under_limit(self):
+        messages = [
+            FakeMessage(
+                i, f"файл {i}", datetime(2026, 1, 1, tzinfo=timezone.utc),
+                media=type("MessageMediaDocument", (), {})(), document=True,
+            )
+            for i in range(1, 4)
+        ]
+        parser = build_parser(messages)
+        with tempfile.TemporaryDirectory() as tmp:
+            await export_mod.export_html(parser, CHANNEL, tmp)
+            zip_base = os.path.join(tmp, "history.zip")
+            # download_media у FakeClient пишет 4 байта — лимит в 1 байт заставит разложить
+            # каждый файл в свою часть архива
+            part_paths = export_mod.zip_dir_split(tmp, zip_base, max_bytes=1)
+            self.assertEqual(len(part_paths), 3)
+            for path in part_paths:
+                self.assertTrue(os.path.isfile(path))
+                with zipfile.ZipFile(path) as zf:
+                    self.assertIn("index.html", zf.namelist())
 
 
 if __name__ == "__main__":

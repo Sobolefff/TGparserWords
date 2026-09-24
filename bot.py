@@ -559,6 +559,28 @@ async def _send_export_file(message: Message, path: str, filename: str, caption:
         )
 
 
+async def _send_export_parts(message: Message, paths: list[str], base_caption: str) -> None:
+    """Отправляет один или несколько файлов подряд; для нескольких — с номером части в подписи."""
+    total = len(paths)
+    for i, path in enumerate(paths, start=1):
+        caption = base_caption if total == 1 else f"{base_caption} Часть {i}/{total}."
+        await _send_export_file(message, path, os.path.basename(path), caption)
+        if i < total:
+            await asyncio.sleep(1)  # не долбить Telegram сериями документов без паузы
+
+
+def _finalize_json_parts(part_paths: list[str], stem) -> list[str]:
+    """Переименовывает временные .partNNN-файлы в финальные history_<stem>[.partXofY].json."""
+    total = len(part_paths)
+    result = []
+    for i, path in enumerate(part_paths, start=1):
+        suffix = f".part{i:03d}of{total:03d}" if total > 1 else ""
+        new_path = os.path.join(os.path.dirname(path), f"history_{stem}{suffix}.json")
+        os.replace(path, new_path)
+        result.append(new_path)
+    return result
+
+
 async def run_export_json(message: Message, link: str) -> None:
     async with search_lock:
         status = await message.answer(f"📥 Подключаюсь к {html.escape(link)}…")
@@ -574,17 +596,21 @@ async def run_export_json(message: Message, link: str) -> None:
                 await edit_status(status, f"📥 {html.escape(title)}: выгружено {count} сообщений…")
 
             try:
-                count = await export.export_json(parser, entity, out_path, progress=progress)
+                part_paths, count = await export.export_json(
+                    parser, entity, out_path, progress=progress,
+                    max_bytes=cfg.max_upload_mb * 1024 * 1024,
+                )
             except Exception as exc:
                 log.exception("ошибка выгрузки истории (json) %s", link)
                 await edit_status(status, f"⚠️ Ошибка при выгрузке: {exc or exc.__class__.__name__}")
                 return
 
-            await edit_status(status, f"✅ Готово: {count} сообщений. Отправляю файл…")
+            total = len(part_paths)
+            note = f", файлов: {total}" if total > 1 else ""
+            await edit_status(status, f"✅ Готово: {count} сообщений{note}. Отправляю…")
             stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
-            await _send_export_file(
-                message, out_path, f"history_{stem}.json", f"История «{title}»: {count} сообщений.",
-            )
+            final_paths = _finalize_json_parts(part_paths, stem)
+            await _send_export_parts(message, final_paths, f"История «{title}»: {count} сообщений.")
 
 
 async def run_export_html(message: Message, link: str) -> None:
@@ -611,14 +637,16 @@ async def run_export_html(message: Message, link: str) -> None:
 
             await edit_status(status, f"📦 Собираю архив ({count} сообщений)…")
             stem = getattr(entity, "username", None) or engine.chat_id_of(entity)
-            zip_path = os.path.join(tmp, f"history_{stem}.zip")
-            export.zip_dir(tmp, zip_path, exclude={os.path.basename(zip_path)})
+            zip_base = os.path.join(tmp, f"history_{stem}.zip")
+            part_paths = export.zip_dir_split(tmp, zip_base, max_bytes=cfg.max_upload_mb * 1024 * 1024)
 
-            await edit_status(status, "✅ Готово. Отправляю архив…")
-            await _send_export_file(
-                message, zip_path, f"history_{stem}.zip",
-                f"История «{title}»: {count} сообщений, HTML + медиа (index.html внутри архива).",
-            )
+            total = len(part_paths)
+            note = f" ({total} файла(ов))" if total > 1 else ""
+            await edit_status(status, f"✅ Готово{note}. Отправляю…")
+            caption = f"История «{title}»: {count} сообщений, HTML + медиа (index.html внутри архива)."
+            if total > 1:
+                caption += " Распакуйте ВСЕ части в одну папку — медиа и страница соберутся вместе."
+            await _send_export_parts(message, part_paths, caption)
 
 
 # ----------------------------------------------------------- настройки

@@ -43,6 +43,7 @@ class _Progress:
 
 MEDIA_SUBDIR = "media"
 MAX_MEDIA_SIZE = 20 * 1024 * 1024  # 20 МБ — крупные файлы не тянем, оставляем ссылку на оригинал
+DEFAULT_MAX_BYTES = 45 * 1024 * 1024  # дефолт, если вызывающий код не передал свой лимит
 
 _URL_RE = re.compile(r"https?://\S+")
 
@@ -55,28 +56,86 @@ def _chat_meta(entity) -> dict:
     }
 
 
+def _part_path(base_path: str, n: int) -> str:
+    root, ext = os.path.splitext(base_path)
+    return f"{root}.part{n:03d}{ext}"
+
+
 # --------------------------------------------------------------- JSON
-async def export_json(parser, entity, out_path: str, progress: ProgressCB = None) -> int:
-    """Пишет JSON потоково в out_path, отдаёт число выгруженных сообщений."""
+class _JsonPartWriter:
+    """Пишет сообщения в JSON-файлы по частям — каждая часть не крупнее max_bytes.
+
+    Части — самостоятельные валидные JSON-объекты (chat/part/messages), не один общий
+    массив: так можно отправлять их по одному, не собирая всё в память для склейки.
+    """
+
+    def __init__(self, base_path: str, max_bytes: int, chat_meta: dict):
+        self.base_path = base_path
+        self.max_bytes = max_bytes
+        self.chat_meta = chat_meta
+        self.part_paths: list[str] = []
+        self._f = None
+        self._first_item = True
+        self._bytes_in_part = 0
+        self._count_in_part = 0
+        self._part_num = 0
+        self._open_new_part()
+
+    def _open_new_part(self) -> None:
+        self._part_num += 1
+        path = _part_path(self.base_path, self._part_num)
+        self.part_paths.append(path)
+        self._f = open(path, "w", encoding="utf-8")
+        header = (
+            "{\n"
+            f'  "chat": {json.dumps(self.chat_meta, ensure_ascii=False)},\n'
+            f'  "part": {self._part_num},\n'
+            '  "messages": [\n'
+        )
+        self._f.write(header)
+        self._bytes_in_part = len(header.encode("utf-8"))
+        self._first_item = True
+        self._count_in_part = 0
+
+    def write(self, item: dict) -> None:
+        entry = json.dumps(item, ensure_ascii=False)
+        piece = entry if self._first_item else f",\n    {entry}"
+        piece_bytes = len(piece.encode("utf-8"))
+        if not self._first_item and self._bytes_in_part + piece_bytes > self.max_bytes:
+            self._close_part()
+            self._open_new_part()
+            piece = entry
+            piece_bytes = len(piece.encode("utf-8"))
+        if self._first_item:
+            piece = "    " + piece
+            piece_bytes = len(piece.encode("utf-8"))
+        self._f.write(piece)
+        self._bytes_in_part += piece_bytes
+        self._first_item = False
+        self._count_in_part += 1
+
+    def _close_part(self) -> None:
+        self._f.write(f'\n  ],\n  "messages_count": {self._count_in_part}\n}}\n')
+        self._f.close()
+
+    def close(self) -> list[str]:
+        self._close_part()
+        return self.part_paths
+
+
+async def export_json(
+    parser, entity, out_path: str, progress: ProgressCB = None, max_bytes: int = DEFAULT_MAX_BYTES,
+) -> tuple[list[str], int]:
+    """Пишет JSON потоково, разбивая на части по max_bytes. Отдаёт (пути частей, число сообщений)."""
+    writer = _JsonPartWriter(out_path, max_bytes, _chat_meta(entity))
     count = 0
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("{\n")
-        f.write(f'  "chat": {json.dumps(_chat_meta(entity), ensure_ascii=False)},\n')
-        f.write(f'  "exported_at": {json.dumps(datetime.now(timezone.utc).isoformat())},\n')
-        f.write('  "messages": [\n')
-        first = True
-        tracker = _Progress(progress)
-        async for item in parser.export_history(entity):
-            if not first:
-                f.write(",\n")
-            f.write("    " + json.dumps(item, ensure_ascii=False))
-            first = False
-            count += 1
-            await tracker.tick(count)
-        f.write("\n  ],\n")
-        f.write(f'  "messages_count": {count}\n')
-        f.write("}\n")
-    return count
+    tracker = _Progress(progress)
+    async for item in parser.export_history(entity):
+        writer.write(item)
+        count += 1
+        await tracker.tick(count)
+    part_paths = writer.close()
+    return part_paths, count
 
 
 # --------------------------------------------------------------- HTML
@@ -214,14 +273,44 @@ async def export_html(
     return html_path, count
 
 
-def zip_dir(src_dir: str, zip_path: str, exclude: set[str] | None = None) -> None:
-    """Упаковывает содержимое src_dir в zip_path (пути внутри архива — относительные)."""
-    exclude = exclude or set()
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _dirs, files in os.walk(src_dir):
-            for name in files:
-                if name in exclude:
-                    continue
-                abs_path = os.path.join(root, name)
-                rel_path = os.path.relpath(abs_path, src_dir)
-                zf.write(abs_path, rel_path)
+def zip_dir_split(
+    src_dir: str, base_zip_path: str, max_bytes: int = DEFAULT_MAX_BYTES,
+) -> list[str]:
+    """Пакует work_dir (index.html + media/) в один или несколько zip ≤ max_bytes.
+
+    index.html копируется в каждую часть (он маленький), остальные файлы (медиа)
+    раскладываются по частям жадным упаковщиком по размеру. Части нужно распаковать
+    в одну и ту же папку — тогда все медиа лягут рядом с одной страницей index.html.
+    """
+    html_path = os.path.join(src_dir, "index.html")
+    html_size = os.path.getsize(html_path) if os.path.isfile(html_path) else 0
+
+    media_dir = os.path.join(src_dir, MEDIA_SUBDIR)
+    media_files: list[tuple[str, int]] = []
+    if os.path.isdir(media_dir):
+        for name in sorted(os.listdir(media_dir)):
+            path = os.path.join(media_dir, name)
+            if os.path.isfile(path):
+                media_files.append((path, os.path.getsize(path)))
+
+    parts: list[list[str]] = [[]]
+    sizes = [html_size]
+    for path, size in media_files:
+        if sizes[-1] + size > max_bytes and parts[-1]:
+            parts.append([])
+            sizes.append(html_size)
+        parts[-1].append(path)
+        sizes[-1] += size
+
+    total = len(parts)
+    root, _ext = os.path.splitext(base_zip_path)
+    part_paths = []
+    for i, files in enumerate(parts, start=1):
+        zip_path = f"{root}.part{i:03d}of{total:03d}.zip" if total > 1 else f"{root}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            if os.path.isfile(html_path):
+                zf.write(html_path, "index.html")
+            for path in files:
+                zf.write(path, os.path.relpath(path, src_dir))
+        part_paths.append(zip_path)
+    return part_paths

@@ -51,6 +51,7 @@ class Config:
     request_delay: float = 0.7
     max_flood_wait: int = 120
     media_timeout: int = 120
+    max_upload_mb: int = 45  # с запасом ниже лимита Telegram на документы у ботов (50 МБ)
 
 
 def load_config(require_bot: bool = True) -> Config:
@@ -97,4 +98,5 @@ def load_config(require_bot: bool = True) -> Config:
         request_delay=_float("REQUEST_DELAY", 0.7),
         max_flood_wait=_int("MAX_FLOOD_WAIT", 120),
         media_timeout=_int("MEDIA_TIMEOUT", 120),
+        max_upload_mb=_int("MAX_UPLOAD_MB", 45),
     )
