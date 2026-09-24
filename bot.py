@@ -67,7 +67,23 @@ cfg: Config
 parser: engine.Parser
 bot: Bot
 search_lock = asyncio.Lock()
+current_task: asyncio.Task | None = None
 dp = Dispatcher()
+
+
+def start_task(coro) -> asyncio.Task:
+    """create_task + запоминаем ссылку, чтобы операцию можно было прервать через /cancel."""
+    global current_task
+    task = asyncio.create_task(coro)
+    current_task = task
+
+    def _clear(done: asyncio.Task) -> None:
+        global current_task
+        if current_task is done:
+            current_task = None
+
+    task.add_done_callback(_clear)
+    return task
 
 
 class Flow(StatesGroup):
@@ -135,6 +151,7 @@ HELP = (
     "/monitor on|off — мониторинг новых сообщений\n"
     "/exporthistory — выгрузка истории чата в JSON\n"
     "/exporthistoryhtml — выгрузка истории чата в HTML+медиа (zip-архив)\n"
+    "/cancel — прервать текущий поиск или выгрузку\n"
     "/settings — параметры, /set ключ значение — изменить\n"
     "/clearresults — очистить базу находок"
 )
@@ -229,7 +246,7 @@ async def cmd_clearwords(message: Message) -> None:
 async def cmd_search(message: Message, state: FSMContext) -> None:
     await state.clear()
     if search_lock.locked():
-        await message.answer("Поиск уже идёт, дождитесь окончания.")
+        await message.answer("Поиск уже идёт, дождитесь окончания (или /cancel, чтобы прервать).")
         return
     chats = storage.list_chats()
     words = storage.list_keywords()
@@ -239,7 +256,17 @@ async def cmd_search(message: Message, state: FSMContext) -> None:
     if not words:
         await message.answer("Сначала добавьте ключевые слова — «🔑 Ключевые слова».", reply_markup=MENU)
         return
-    asyncio.create_task(run_search(message, chats, words))
+    start_task(run_search(message, chats, words))
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if current_task and not current_task.done():
+        current_task.cancel()
+        await message.answer("⛔️ Прерываю текущую операцию…", reply_markup=MENU)
+    else:
+        await message.answer("Сейчас ничего не выполняется.", reply_markup=MENU)
 
 
 async def run_search(message: Message, chats, words) -> None:
@@ -441,7 +468,7 @@ async def cmd_clearresults(message: Message) -> None:
 @dp.message(F.text == BTN_HISTORY_JSON)
 async def cmd_export_history_json(message: Message, state: FSMContext) -> None:
     if search_lock.locked():
-        await message.answer("Сейчас идёт другая операция (поиск или выгрузка) — дождитесь окончания.")
+        await message.answer("Сейчас идёт другая операция (поиск или выгрузка) — дождитесь окончания (или /cancel).")
         return
     await state.set_state(Flow.history_json)
     await message.answer(
@@ -458,7 +485,7 @@ async def cmd_export_history_json(message: Message, state: FSMContext) -> None:
 @dp.message(F.text == BTN_HISTORY_HTML)
 async def cmd_export_history_html(message: Message, state: FSMContext) -> None:
     if search_lock.locked():
-        await message.answer("Сейчас идёт другая операция (поиск или выгрузка) — дождитесь окончания.")
+        await message.answer("Сейчас идёт другая операция (поиск или выгрузка) — дождитесь окончания (или /cancel).")
         return
     await state.set_state(Flow.history_html)
     await message.answer(
@@ -483,9 +510,9 @@ async def do_export_history_json(message: Message, state: FSMContext) -> None:
         )
         return
     if search_lock.locked():
-        await message.answer("Сейчас идёт другая операция — попробуйте чуть позже.")
+        await message.answer("Сейчас идёт другая операция — попробуйте чуть позже (или /cancel, чтобы прервать её).")
         return
-    asyncio.create_task(run_export_json(message, link))
+    start_task(run_export_json(message, link))
 
 
 @dp.message(Flow.history_html, PLAIN_TEXT)
@@ -499,9 +526,9 @@ async def do_export_history_html(message: Message, state: FSMContext) -> None:
         )
         return
     if search_lock.locked():
-        await message.answer("Сейчас идёт другая операция — попробуйте чуть позже.")
+        await message.answer("Сейчас идёт другая операция — попробуйте чуть позже (или /cancel, чтобы прервать её).")
         return
-    asyncio.create_task(run_export_html(message, link))
+    start_task(run_export_html(message, link))
 
 
 def _pick_history_link(text: str) -> str | None:

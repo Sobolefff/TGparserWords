@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import time
 import zipfile
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
@@ -20,7 +21,25 @@ import parser as engine
 log = logging.getLogger("export")
 
 ProgressCB = Callable[[int], Awaitable[None]] | None
-PROGRESS_EVERY = 200
+# Обновляем статус либо каждые N сообщений, либо раз в T секунд — что наступит раньше.
+# Только счётчика недостаточно: в маленьком канале скачивание медиа может идти минутами,
+# а сообщений там меньше порога — без таймера статус так и провисит на "подключаюсь".
+PROGRESS_EVERY = 20
+PROGRESS_SECONDS = 8.0
+
+
+class _Progress:
+    def __init__(self, cb: ProgressCB):
+        self._cb = cb
+        self._last_ts = time.monotonic()
+
+    async def tick(self, count: int) -> None:
+        if not self._cb:
+            return
+        now = time.monotonic()
+        if count % PROGRESS_EVERY == 0 or now - self._last_ts >= PROGRESS_SECONDS:
+            self._last_ts = now
+            await self._cb(count)
 
 MEDIA_SUBDIR = "media"
 MAX_MEDIA_SIZE = 20 * 1024 * 1024  # 20 МБ — крупные файлы не тянем, оставляем ссылку на оригинал
@@ -46,14 +65,14 @@ async def export_json(parser, entity, out_path: str, progress: ProgressCB = None
         f.write(f'  "exported_at": {json.dumps(datetime.now(timezone.utc).isoformat())},\n')
         f.write('  "messages": [\n')
         first = True
+        tracker = _Progress(progress)
         async for item in parser.export_history(entity):
             if not first:
                 f.write(",\n")
             f.write("    " + json.dumps(item, ensure_ascii=False))
             first = False
             count += 1
-            if progress and count % PROGRESS_EVERY == 0:
-                await progress(count)
+            await tracker.tick(count)
         f.write("\n  ],\n")
         f.write(f'  "messages_count": {count}\n')
         f.write("}\n")
@@ -152,6 +171,7 @@ async def export_html(
     title = engine.title_of(entity)
 
     count = 0
+    tracker = _Progress(progress)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(_HTML_HEAD.format(
             title=html_lib.escape(title),
@@ -187,8 +207,7 @@ async def export_html(
             f.write("</div>\n")
 
             count += 1
-            if progress and count % PROGRESS_EVERY == 0:
-                await progress(count)
+            await tracker.tick(count)
 
         f.write(_HTML_TAIL.format(count=count))
 

@@ -50,6 +50,7 @@ class Config:
     auto_join: bool = False
     request_delay: float = 0.7
     max_flood_wait: int = 120
+    media_timeout: int = 120
 
 
 def load_config(require_bot: bool = True) -> Config:
@@ -95,4 +96,5 @@ def load_config(require_bot: bool = True) -> Config:
         auto_join=_bool("AUTO_JOIN", False),
         request_delay=_float("REQUEST_DELAY", 0.7),
         max_flood_wait=_int("MAX_FLOOD_WAIT", 120),
+        media_timeout=_int("MEDIA_TIMEOUT", 120),
     )

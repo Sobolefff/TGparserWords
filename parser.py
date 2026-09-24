@@ -296,13 +296,20 @@ class Parser:
         dest = os.path.join(dest_dir, str(msg.id))
         while True:
             try:
-                return await self.client.download_media(msg, file=dest)
+                return await asyncio.wait_for(
+                    self.client.download_media(msg, file=dest), timeout=self.cfg.media_timeout
+                )
             except FloodWaitError as exc:
                 if exc.seconds > self.cfg.max_flood_wait:
                     log.warning("FloodWait %s сек при скачивании медиа %s — пропущено", exc.seconds, msg.id)
                     return None
                 log.info("FloodWait %s сек — ждём (медиа)", exc.seconds)
                 await asyncio.sleep(exc.seconds + 1)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "скачивание медиа %s не уложилось в %s сек — пропущено", msg.id, self.cfg.media_timeout
+                )
+                return None
             except Exception:
                 log.exception("не удалось скачать медиа сообщения %s", msg.id)
                 return None
